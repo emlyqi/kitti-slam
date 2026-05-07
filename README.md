@@ -1,6 +1,6 @@
 # SLAM from Scratch
 
-Visual SLAM in Python, built from scratch and validated on KITTI Odometry. Implements stereo visual odometry, BoW loop closure detection, and pose graph optimization with GTSAM. IMU fusion in progress.
+Visual SLAM in Python, built from scratch and validated on KITTI Odometry. Implements stereo visual odometry, BoW loop closure detection, pose graph optimization, and bundle adjustment with GTSAM.
 
 ![KITTI 05 trajectory](results/kitti_05/plots/trajectory_comparison_trajectories.png)
 
@@ -10,12 +10,14 @@ Visual SLAM in Python, built from scratch and validated on KITTI Odometry. Imple
 
 2.7km urban driving with multiple loop revisits, evaluated against GPS/IMU ground truth.
 
-| Metric | VO baseline | After PGO |
-|---|---|---|
-| ATE RMSE | 7.65 m | **2.03 m** (73% reduction) |
-| ATE max | 19.48 m | 4.56 m |
-| RPE (100m) | 1.27 m / 100m (1.27%) | 1.70 m / 100m |
-| Loops detected | — | 1447 |
+| Metric | VO baseline | After PGO | After BA |
+|---|---|---|---|
+| ATE RMSE | 7.65 m | **2.03 m** (73% reduction) | 7.51 m (2% reduction) |
+| ATE max | 19.48 m | 4.56 m | 19.44 m |
+| RPE (100m) | 1.27 m / 100m | 1.70 m / 100m | — |
+| Loops detected | — | 1447 | — |
+
+PGO achieves the best results through explicit loop closure handling. Bundle adjustment improves local geometric consistency but requires distributed loop constraints for global drift correction (see writeup for analysis).
 
 ### KITTI 07 — VO only
 
@@ -72,12 +74,24 @@ data/kitti/
 The pipeline is config-driven. Replace `kitti_05` with `kitti_07` (or any new config) to switch sequences.
 
 ```bash
+# Visual odometry
 python -m scripts.run_vo --config configs/kitti_05.yaml
+
+# Loop closure detection
 python -m scripts.train_vocabulary --config configs/kitti_05.yaml
 python -m scripts.detect_loops --config configs/kitti_05.yaml
+
+# Pose graph optimization (best results)
 python -m scripts.run_pose_graph --config configs/kitti_05.yaml
 python -m scripts.interpolate_full_trajectory --config configs/kitti_05.yaml
 
+# Bundle adjustment (optional - local geometry refinement)
+python -m scripts.run_bundle_adjustment --config configs/kitti_05.yaml
+python -m scripts.interpolate_full_trajectory --config configs/kitti_05.yaml \
+    --input results/kitti_05/trajectories/ba_optimized.txt \
+    --output results/kitti_05/trajectories/ba_optimized_full.txt
+
+# Evaluation
 evo_ape kitti data/kitti/05/poses/05.txt results/kitti_05/trajectories/vo.txt --align --plot
 evo_ape kitti data/kitti/05/poses/05.txt results/kitti_05/trajectories/optimized_full.txt --align --plot
 evo_rpe kitti data/kitti/05/poses/05.txt results/kitti_05/trajectories/optimized_full.txt --align --delta 100 --delta_unit m --plot

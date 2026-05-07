@@ -54,6 +54,22 @@ where `anchor` is the most recent keyframe at or before frame f, and the anchor-
 
 Module layout in `src/pose_graph/`: `builder.py` (factor graph construction), `optimizer.py` (LM wrapper), with the trajectory propagation in `scripts/interpolate_full_trajectory.py`.
 
+### Bundle adjustment
+
+Bundle adjustment jointly optimizes camera poses and 3D landmark positions by minimizing reprojection error. The factor graph has pose variables (one per keyframe), point variables (one per landmark), and reprojection factors connecting them. Each reprojection factor measures pixel error: transform the landmark into the keyframe's camera frame, project to image coordinates, compare to the observed pixel.
+
+**Persistent landmarks.** At each keyframe, match ORB descriptors against the previous keyframe using Lowe's ratio test. Matched features inherit landmark IDs; unmatched features create new landmarks. Each landmark stores its world position and a list of (keyframe_idx, pixel) observations.
+
+**Filtering.** Landmarks with few observations add noise without strong geometric constraint. The system filters to landmarks observed in ≥10 keyframes before optimization, reducing the problem from ~230k raw landmarks to ~10k well-constrained ones.
+
+**Coordinate frames.** GTSAM's `GenericProjectionFactorCal3_S2` expects poses as T_camera_from_world (inverse of VO's T_world_from_camera). Early attempts without this inversion caused immediate divergence. Also needed: explicit `gtsam.Point3` wrapping of landmark positions (numpy arrays alone silently fail type checks).
+
+**Scaling.** Initial attempts on all 1752 keyframes with tight parameters (σ = 1px, min_obs = 3) hit numerical instability — the Hessian became ill-conditioned and LM quit at iteration 0. Systematic tests found the working regime: relax projection noise to σ = 10px (reflecting accumulated stereo + tracking uncertainty) and filter to min_obs = 10 (only well-constrained landmarks). This converged on all 1752 keyframes with 88.7% internal error reduction.
+
+**Loop closure integration.** Adding loop BetweenFactors (same as PGO) alongside reprojection factors creates constraint conflicts. Loop transforms were computed from VO poses; as BA refines landmarks and shifts poses slightly, the original loop transforms become inconsistent with the new geometry. Loose loop noise (σ_trans = 10m, σ_rot = 30°) allows convergence but degrades ATE (7.5m → 15.6m). The loop factors fight the reprojection-based corrections rather than reinforcing them.
+
+Module layout in `src/bundle_adjustment/`: `builder.py` (factor graph with projection + optional loop factors), with landmark tracking in `src/vo/landmarks.py`.
+
 ## Design choices
 
 ### Stereo 3D-to-2D PnP over alternatives
@@ -151,6 +167,26 @@ For KITTI 05 with the values in the parameter table:
 
 KITTI 07's failure (next section) made it clear that mismatched sigmas make things worse, not better.
 
+### BA: min_observations = 10 filters to well-constrained landmarks only
+
+With min_observations = 3, the system included 231k landmarks but the optimization failed immediately (iteration 0, cost → infinity). Many 3-observation landmarks are poorly triangulated (small baseline, large depth uncertainty) or inconsistently tracked (entering/leaving frame boundaries, occlusions). These weak landmarks add thousands of noisy constraints without useful geometric information, destabilizing the Hessian.
+
+Filtering to min_observations = 10 keeps only 10.6k landmarks (< 5% of the original) but these are observed across many viewpoints with strong multi-view geometry. The Hessian becomes well-conditioned and optimization succeeds.
+
+### BA: projection_sigma = 10px reflects accumulated uncertainty
+
+Raw ORB detection is sub-pixel (~0.3px), but BA's observations chain through stereo matching (±1px disparity), triangulation, keyframe-to-keyframe optical flow (±0.5px per hop), and accumulate over up to 1752 keyframes. Effective uncertainty is several pixels by the time a landmark reaches its 10th observation.
+
+Setting σ = 1px claims perfect measurements and forces the optimizer to satisfy every conflicting pixel exactly → numerical instabilities. σ = 10px reflects actual noise and makes optimization robust to tracking drift and stereo errors.
+
+### BA + loops: why adding loops degrades ATE
+
+In PGO, all constraints are BetweenFactorPose3 (pose to pose). Odometry and loops differ only in sigma tuning. In BA, reprojection factors (pose + landmark → pixel) and BetweenFactors (pose to pose) are different constraint types.
+
+Reprojection factors can adjust both poses and landmarks to satisfy observations. BetweenFactors only constrain poses with no landmark flexibility. When loop BetweenFactors (computed from VO's unoptimized geometry) are added, they encode the original VO-derived relative poses. As BA refines landmarks and shifts poses to minimize reprojection error, these shifts conflict with the rigid loop constraints. The loop factors fight BA's corrections instead of reinforcing them.
+
+Loose loop noise (σ_trans = 10m, σ_rot = 30°) allows convergence but makes loops so weak they're nearly irrelevant. Tighter noise causes divergence. The proper fix: recompute loop transforms on BA-optimized geometry, or encode loops via matched landmark observations rather than pose-pose factors. Both are substantial implementation changes beyond this project's scope.
+
 ### Parameter choices
 
 | Parameter | Value | Why |
@@ -173,6 +209,8 @@ KITTI 07's failure (next section) made it clear that mismatched sigmas make thin
 | Odometry sigma (trans / rot) | 0.1 m / 2° | Reflects expected per-keyframe VO accuracy. |
 | Loop sigma (trans / rot) | 1.0 m / 10°, scaled by inliers | Looser than odometry — loop measurements have more noise (longer baseline, larger viewpoint differences). Inlier scaling factors in per-loop confidence. |
 | Prior sigma (trans / rot) | 1e-3 | Effectively pins keyframe 0 in place. Fixes gauge freedom in the optimization. |
+| BA projection sigma | 10 px | Reflects accumulated stereo + tracking uncertainty over many keyframes. |
+| BA min_observations | 10 | Only well-constrained landmarks. Filtering to this makes the Hessian well-conditioned at full scale. |
 
 ### SE(3) composition direction
 
@@ -254,6 +292,35 @@ The y-axis drift accumulates rapidly between kf 350 and kf 500. The strongest lo
 
 Thus, pose graph optimization can hurt ATE when loop constraints don't span the trajectory, especially evident with KITTI 07's "drive away, return at the end" pattern. KITTI 05's distributed loops (the car drives through similar streets multiple times throughout the sequence) is closer to the ideal case. 
 
+### Bundle adjustment - scaling and loop integration
+
+BA was tested on KITTI 05 to understand scaling limits and loop closure integration.
+
+**Scaling tests.** Initial attempts with all 1752 keyframes and default parameters (projection_sigma = 1.0px, min_observations = 3) failed at iteration 0 with costs in the hundreds of billions. 231k weakly-constrained landmarks created an ill-conditioned Hessian. Systematic parameter sweeps found the working regime:
+
+| Configuration | Landmarks | Factors | Error Reduction |
+|---|---|---|---|
+| 3 kf, min_obs=3, σ=3px | 379 | 1.1k | 88.5% (50 iter) |
+| 50 kf, min_obs=3, σ=3px | 6.8k | 29k | 76.5% (3 iter) |
+| 200 kf, min_obs=5, σ=5px | 7.4k | 52k | 87.7% (6 iter) |
+| 500 kf, min_obs=7, σ=5px | 7.4k | 69k | 95.2% (4 iter) |
+| **1752 kf, min_obs=10, σ=10px** | **10.6k** | **140k** | **88.7% (3 iter)** |
+
+The final working parameters: min_observations = 10 keeps only landmarks seen across many views (well-conditioned geometry), projection_sigma = 10px reflects accumulated stereo + tracking noise over 1752 keyframes.
+
+**ATE comparison.** After interpolating optimized keyframes to the full 2761-frame trajectory:
+
+| Method | ATE RMSE | vs VO |
+|---|---|---|
+| VO baseline | 7.65 m | — |
+| **PGO (VO + loops)** | **2.03 m** | **73% improvement** |
+| BA (reprojection only) | 7.51 m | 2% improvement |
+| BA + loops (σ_loop = 10m/30°) | 15.6 m | 104% worse |
+
+BA alone marginally improves local geometry but can't fix global drift. Adding loop BetweenFactors alongside reprojection factors causes constraint conflicts - the loop transforms (computed from VO geometry) fight BA's landmark-driven pose refinements. Loose loop noise allows convergence but degrades rather than improves ATE.
+
+PGO remains the best approach: loop handling through BetweenFactors without landmark variables avoids the conflicts that hurt BA+loops.
+
 ## Limitations
 
 - **Loop closures must be distributed.** Endpoint-only loops can degrade ATE, as shown on KITTI 07. Real applications should aim for trajectories with revisits throughout, not just at the end.
@@ -261,6 +328,9 @@ Thus, pose graph optimization can hurt ATE when loop constraints don't span the 
 - **No gravity reference.** Vertical drift is the dominant failure mode for vision-only VO and isn't fixed by pose-pose loop closure alone (loops only constrain relative position, not absolute orientation in gravity frame). Adding IMU is the standard fix and is the next module.
 - **Static-world assumption.** Both VO and BoW assume the scene doesn't change. Moving objects (cars, pedestrians) generate outlier features that RANSAC mostly handles, but heavy dynamic content would degrade tracking.
 - **Performance depends on scene texture.** Urban driving is feature-rich; low-texture environments (indoor walls, foggy outdoor, highway) would degrade tracking and BoW retrieval.
+- **Bundle adjustment scaling.** Full-scale BA with all landmarks is numerically unstable. The working configuration filters to only the top 5% most well-constrained landmarks. Production systems use incremental BA with sliding windows or hierarchical methods rather than batch optimization over all keyframes.
+- **Loop closures degrade BA.** Unlike PGO where loops give 73% improvement, adding loop BetweenFactors to BA worsens ATE (7.5m → 15.6m). Loop transforms computed for pose-only optimization conflict with BA's joint pose+landmark solution.
+- **Landmark tracking assumes descriptor stability.** ORB descriptors must remain stable across viewpoint changes. Works well for planar surfaces (walls, road markings) at similar angles. Features on curved surfaces or at severe viewpoint changes may fail to match even when geometrically valid, causing landmark fragmentation.
 
 ## Future work
 
@@ -276,6 +346,14 @@ An IMU's accelerometer measures gravity, providing an absolute roll and pitch re
 
 The plan is to add gyroscope-derived attitude factors to the existing GTSAM pose graph using the OXTS RT3003 inertial stream from KITTI Raw at 100Hz. Each keyframe transition gets an additional `Rot3AttitudeFactor` (or equivalent) constraining the rotation component of the keyframe-to-keyframe transform based on integrated gyroscope readings between the two timestamps.
 
+### Bundle adjustment improvements
+
+**Incremental/windowed BA.** Rather than batch-optimizing all keyframes, maintain a sliding window of recent keyframes and marginalize out older ones. ORB-SLAM2 uses covisibility graphs to identify local neighborhoods (keyframes observing the same landmarks) and only jointly optimizes those regions, keeping the problem tractable while refining the active map.
+
+**Landmark-based loop closure.** Instead of pose-pose BetweenFactors, match landmarks between loop candidates and add observations to existing landmarks' observation lists. The reprojection factors naturally constrain both keyframes without factor-type conflicts. Avoids the degradation seen with current BA+loops.
+
+**Robust cost functions.** Current L2 reprojection error treats all observations equally. Huber or Tukey costs would downweight large residuals (tracking failures, outliers missed by RANSAC) without completely discarding them, improving robustness to dynamics and occlusions.
+
 ## Code
 
 - [`src/vo/features.py`](src/vo/features.py): ORB + LK with bidirectional filter
@@ -284,16 +362,19 @@ The plan is to add gyroscope-derived attitude factors to the existing GTSAM pose
 - [`src/vo/keyframes.py`](src/vo/keyframes.py): keyframe selection
 - [`src/vo/trajectory.py`](src/vo/trajectory.py): SE(3) trajectory + KITTI I/O
 - [`src/vo/keyframe_logger.py`](src/vo/keyframe_logger.py): keyframe persistence
+- [`src/vo/landmarks.py`](src/vo/landmarks.py): persistent landmark tracking with descriptor matching
 - [`src/loop_closure/vocabulary.py`](src/loop_closure/vocabulary.py): BoW vocabulary training
 - [`src/loop_closure/database.py`](src/loop_closure/database.py): TF-IDF database + query
 - [`src/loop_closure/verification.py`](src/loop_closure/verification.py): geometric verification
 - [`src/loop_closure/detector.py`](src/loop_closure/detector.py): full loop detection pipeline
 - [`src/pose_graph/builder.py`](src/pose_graph/builder.py): GTSAM factor graph construction
 - [`src/pose_graph/optimizer.py`](src/pose_graph/optimizer.py): Levenberg-Marquardt wrapper
+- [`src/bundle_adjustment/builder.py`](src/bundle_adjustment/builder.py): BA factor graph with reprojection + optional loop factors
 - [`src/utils/transforms.py`](src/utils/transforms.py): SE(3) helpers
 - [`src/utils/config.py`](src/utils/config.py): YAML config loader with per-sequence paths
 - [`scripts/run_vo.py`](scripts/run_vo.py): VO main loop
 - [`scripts/train_vocabulary.py`](scripts/train_vocabulary.py): vocabulary training
 - [`scripts/detect_loops.py`](scripts/detect_loops.py): loop detection pipeline
 - [`scripts/run_pose_graph.py`](scripts/run_pose_graph.py): pose graph optimization
+- [`scripts/run_bundle_adjustment.py`](scripts/run_bundle_adjustment.py): bundle adjustment with optional loops
 - [`scripts/interpolate_full_trajectory.py`](scripts/interpolate_full_trajectory.py): propagate optimized keyframes to all frames
